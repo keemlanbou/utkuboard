@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Utku Board</title>
-    <!-- Utku Board v3.4.4 — single-file infinite canvas whiteboard -->
+    <!-- Utku Board v3.5.3 — single-file infinite canvas whiteboard -->
     
     <!-- PWA & iOS App Support -->
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -171,7 +171,55 @@ const openLinkSafely = (url) => {
   }
   window.open(safe, '_blank', 'noopener,noreferrer');
 };
-const APP_VERSION = '3.4.4';
+const APP_VERSION = '3.5.3';
+
+// Clipboard format for board items (lets copy/paste tell board data apart from external content)
+const CLIP_MIME = 'application/x-utkuboard';
+
+// Remembers which file each project was opened from / saved to (Chrome/Edge File System Access).
+// Handles live in IndexedDB so "Save" keeps writing to the same file, even after reopening.
+const HandleStore = (() => {
+  const open = () => new Promise((res, rej) => {
+    const r = indexedDB.open('utkuboard_handles', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('handles');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  const run = async (mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => {
+      const t = db.transaction('handles', mode);
+      const req = fn(t.objectStore('handles'));
+      t.oncomplete = () => res(req ? req.result : undefined);
+      t.onerror = () => rej(t.error);
+    });
+  };
+  return {
+    get: (id) => run('readonly', s => s.get(id)).catch(() => null),
+    set: (id, h) => run('readwrite', s => s.put(h, id)).catch(() => {}),
+  };
+})();
+
+// Remove connections attached to deleted nodes. Deleted reroute nodes "heal":
+// every wire coming in is reconnected to every wire going out (UE-style).
+const pruneConnections = (cs, deletedIds, els) => {
+  let next = cs;
+  els.filter(el => el.type === 'reroute' && deletedIds.has(el.id)).forEach(r => {
+    const ins = next.filter(c => c.toId === r.id && c.fromId !== r.id);
+    const outs = next.filter(c => c.fromId === r.id && c.toId !== r.id);
+    const rest = next.filter(c => c.toId !== r.id && c.fromId !== r.id);
+    const bridged = [];
+    ins.forEach(i => outs.forEach(o => {
+      if (i.fromId === o.toId) return;
+      const dup = [...rest, ...bridged].some(c =>
+        (c.fromId === i.fromId && c.fromPort === i.fromPort && c.toId === o.toId && c.toPort === o.toPort) ||
+        (c.fromId === o.toId && c.fromPort === o.toPort && c.toId === i.fromId && c.toPort === i.fromPort));
+      if (!dup) bridged.push({ ...o, id: generateId(), fromId: i.fromId, fromPort: i.fromPort });
+    }));
+    next = [...rest, ...bridged];
+  });
+  return next.filter(c => !deletedIds.has(c.fromId) && !deletedIds.has(c.toId));
+};
 const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
 
 const getExactHeight = (node) => {
@@ -277,8 +325,29 @@ function App() {
   const [projects, setProjects] = useState([]);
   const [activeProject, setActiveProject] = useState(null);
 
+  // Chrome/Edge: open with the native picker so we keep a handle to the file —
+  // then "Save" writes straight back to it without asking again.
+  const openWithHandle = async () => {
+    let handle;
+    try {
+      [handle] = await window.showOpenFilePicker({
+        multiple: false,
+        types: [{ description: 'Utku Board File', accept: { 'application/json': ['.utkuboard', '.json'] } }]
+      });
+    } catch (err) { return; } // cancelled
+    let parsed;
+    try { parsed = JSON.parse(await (await handle.getFile()).text()); }
+    catch (err) { alert("Invalid project file — could not parse JSON."); return; }
+    if (!parsed.id || !parsed.elements) { alert("Invalid project file — missing required data."); return; }
+    await HandleStore.set(parsed.id, handle);
+    saveToDashboard(parsed);
+    setActiveProject(parsed);
+    setView('editor');
+  };
+
   // Open a project via the file picker (fallback path)
   const loadProjectViaPicker = () => {
+    if (window.showOpenFilePicker) { openWithHandle(); return; }
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.utkuboard,.json';
@@ -415,7 +484,7 @@ function App() {
               <span className="font-semibold">New Board</span>
             </div>
 
-            <label className={`h-48 rounded-2xl border-2 border-dashed ${theme === 'dark' ? 'border-zinc-700 hover:border-green-500 hover:bg-zinc-800' : 'border-gray-300 hover:border-green-500 hover:bg-green-50'} flex flex-col items-center justify-center cursor-pointer transition-all group`}>
+            <label onClick={(e) => { if (window.showOpenFilePicker) { e.preventDefault(); openWithHandle(); } }} className={`h-48 rounded-2xl border-2 border-dashed ${theme === 'dark' ? 'border-zinc-700 hover:border-green-500 hover:bg-zinc-800' : 'border-gray-300 hover:border-green-500 hover:bg-green-50'} flex flex-col items-center justify-center cursor-pointer transition-all group`}>
               <div className="w-12 h-12 rounded-full bg-green-500/20 text-green-500 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
                 <Icon name="upload" size={24} />
               </div>
@@ -490,7 +559,12 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
   const [connections, setConnections] = useState(initialProject.connections || []);
   const [frames, setFrames] = useState(initialProject.frames || []);
   
-  const [fileHandle, setFileHandle] = useState(null); 
+  const [fileHandle, setFileHandle] = useState(null);
+  // Restore the file this project was last saved to / opened from
+  useEffect(() => {
+    if (!window.showSaveFilePicker) return;
+    HandleStore.get(initialProject.id).then(h => { if (h) setFileHandle(h); });
+  }, []);
 
   // Undo/Redo State
   const [past, setPast] = useState([]);
@@ -539,6 +613,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
 
   // Header and Settings
   const [lastSaved, setLastSaved] = useState(null);
+  const [saveNotice, setSaveNotice] = useState(null); // shown when a quick save had to fall back to the picker
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [showSearch, setShowSearch] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
@@ -552,6 +627,12 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
   const workspaceRef = useRef(null);
   const wheelAccumulator = useRef(0);
   const clipboardRef = useRef(null);
+  const copyFiredRef = useRef(false);   // did the browser's native copy/cut event run?
+  const pasteFiredRef = useRef(false);  // did the browser's native paste event run?
+  const connClickTimer = useRef(null);  // single-click vs double-click on a connection
+  // Always-current view of the board, so keyboard/clipboard handlers and undo never read stale state
+  const liveRef = useRef({});
+  liveRef.current = { elements, frames, connections, past, future, selectedIds };
   const isInitialMount = useRef(true);
   const transformRef = useRef({ x: 0, y: 0, scale: 0.5 });
   const rafId = useRef(null);
@@ -856,11 +937,148 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
     };
   }, [selectedIds]);
 
-  // Paste Listener for Links & Images
+  // --- CLIPBOARD (copy / cut / paste) ---
+  // Board items go to the system clipboard in their own format (CLIP_MIME), so a paste
+  // always does exactly ONE thing: board items, OR an external image / link / text.
+  const isTypingInField = () => {
+    const a = document.activeElement;
+    return !!a && (['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName) || a.isContentEditable);
+  };
+
+  const buildClipboardPayload = () => {
+    const { selectedIds, elements, frames, connections } = liveRef.current;
+    if (!selectedIds || selectedIds.size === 0) return null;
+    const els = elements.filter(el => selectedIds.has(el.id));
+    const frs = frames.filter(f => selectedIds.has(f.id));
+    if (els.length === 0 && frs.length === 0) return null;
+    const ids = new Set([...els.map(el => el.id), ...frs.map(f => f.id)]);
+    const conns = connections.filter(c => ids.has(c.fromId) && ids.has(c.toId));
+    const text = els.map(el => {
+      if (el.type === 'card') return [el.content, ...(el.tasks || []).map(t => '- ' + (t.text || ''))].filter(Boolean).join('\n');
+      if (el.type === 'link') return el.url || '';
+      if (el.type === 'image' || el.type === 'reroute') return '';
+      return typeof el.content === 'string' ? el.content : '';
+    }).filter(Boolean).join('\n\n');
+    return {
+      utkuboard: 1, token: generateId(), projectId: project.id,
+      elements: els, frames: frs, connections: conns,
+      clipText: text || `Utku Board selection (${ids.size} item${ids.size > 1 ? 's' : ''})`,
+      pasteCount: 0
+    };
+  };
+
+  const deleteSelection = () => {
+    const { selectedIds, elements } = liveRef.current;
+    if (!selectedIds || selectedIds.size === 0) return;
+    const ids = new Set(selectedIds);
+    takeSnapshot();
+    setElements(els => els.filter(el => !ids.has(el.id)));
+    setFrames(fs => fs.filter(f => !ids.has(f.id)));
+    setConnections(cs => pruneConnections(cs, ids, elements));
+    setSelectedIds(new Set());
+  };
+
+  // Paste board items (from this board, another board, or another tab)
+  const pasteBoardData = (data) => {
+    if (!data || (!(data.elements || []).length && !(data.frames || []).length)) return;
+    const ref = clipboardRef.current;
+    let dx, dy;
+    if (ref && data === ref && data.projectId === project.id) {
+      // Same board: cascade each paste 30px further
+      ref.pasteCount = (ref.pasteCount || 0) + 1;
+      dx = dy = 30 * ref.pasteCount;
+    } else {
+      // Other board: drop it in the middle of the current view
+      const b = getContentBounds(data.elements || [], data.frames || []);
+      const rect = workspaceRef.current.getBoundingClientRect();
+      const t = transformRef.current;
+      const cx = (-t.x + rect.width / 2) / t.scale, cy = (-t.y + rect.height / 2) / t.scale;
+      dx = b ? cx - (b.x + b.width / 2) : 0;
+      dy = b ? cy - (b.y + b.height / 2) : 0;
+    }
+    takeSnapshot();
+    const idMap = {}, taskMap = {}, groupMap = {};
+    const mapGroup = (g) => g ? (groupMap[g] || (groupMap[g] = generateId())) : g;
+    const newEls = (data.elements || []).map(el => {
+      const c = JSON.parse(JSON.stringify(el));
+      c.id = generateId(); idMap[el.id] = c.id;
+      if (c.type === 'arrow') {
+        c.startX += dx; c.startY += dy; c.endX += dx; c.endY += dy;
+      } else { c.x += dx; c.y += dy; }
+      if (c.tasks) c.tasks.forEach(t => { const nid = generateId(); taskMap[t.id] = nid; t.id = nid; });
+      c.groupId = mapGroup(c.groupId);
+      return c;
+    });
+    const newFrames = (data.frames || []).map(f => {
+      const c = JSON.parse(JSON.stringify(f));
+      c.id = generateId(); idMap[f.id] = c.id;
+      c.x += dx; c.y += dy;
+      c.groupId = mapGroup(c.groupId);
+      return c;
+    });
+    const mapPort = (p) => (p && p.startsWith && p.startsWith('out-') && taskMap[p.slice(4)]) ? 'out-' + taskMap[p.slice(4)] : p;
+    const newConns = (data.connections || []).filter(c => idMap[c.fromId] && idMap[c.toId]).map(c => ({
+      ...c, id: generateId(), fromId: idMap[c.fromId], toId: idMap[c.toId], fromPort: mapPort(c.fromPort), toPort: mapPort(c.toPort)
+    }));
+    setElements(els => [...els, ...newEls]);
+    setFrames(fs => [...fs, ...newFrames]);
+    if (newConns.length) setConnections(cs => [...cs, ...newConns]);
+    setSelectedIds(new Set([...newEls.map(e => e.id), ...newFrames.map(f => f.id)]));
+  };
+
+  // Native copy / cut events (Ctrl+C, Ctrl+X, Edit menu)
+  useEffect(() => {
+    const handleCopy = (e) => {
+      if (isTypingInField()) return;
+      const p = buildClipboardPayload();
+      if (!p) return;
+      copyFiredRef.current = true;
+      if (e.type === 'cut') p.pasteCount = -1; // first paste after a cut lands in the original spot
+      clipboardRef.current = p;
+      try {
+        e.clipboardData.setData('text/plain', p.clipText);
+        const json = JSON.stringify({ utkuboard: 1, token: p.token, projectId: p.projectId, elements: p.elements, frames: p.frames, connections: p.connections });
+        if (json.length < 25 * 1024 * 1024) e.clipboardData.setData(CLIP_MIME, json);
+        e.preventDefault();
+      } catch (err) {}
+      if (e.type === 'cut') deleteSelection();
+    };
+    document.addEventListener('copy', handleCopy);
+    document.addEventListener('cut', handleCopy);
+    return () => { document.removeEventListener('copy', handleCopy); document.removeEventListener('cut', handleCopy); };
+  });
+
+  // Paste Listener: board items, images, links and plain text
   useEffect(() => {
     const handlePaste = async (e) => {
-      if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
-      
+      pasteFiredRef.current = true;
+      if (isTypingInField()) return;
+      const cd = e.clipboardData;
+
+      // 0. Board items copied in Utku Board (this board, another board or another tab)
+      let custom = '';
+      try { custom = cd ? cd.getData(CLIP_MIME) : ''; } catch (err) {}
+      if (custom) {
+        try {
+          const data = JSON.parse(custom);
+          if (data && data.utkuboard) {
+            e.preventDefault();
+            const ref = clipboardRef.current;
+            pasteBoardData(ref && ref.token === data.token ? ref : data);
+            return;
+          }
+        } catch (err) {}
+      }
+      const hasImage = !!(cd && cd.items && Array.from(cd.items).some(it => it.type.indexOf('image') !== -1));
+      const plain = (cd && (cd.getData('text/plain') || cd.getData('text'))) || '';
+      const ref = clipboardRef.current;
+      // Fallback for browsers that drop the custom format: the clipboard still holds exactly what we copied
+      if (!hasImage && ref && plain && plain === ref.clipText) {
+        e.preventDefault();
+        pasteBoardData(ref);
+        return;
+      }
+
       // 1. Check for Image Data in Clipboard
       if (e.clipboardData && e.clipboardData.items) {
         const items = e.clipboardData.items;
@@ -982,15 +1200,34 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
             }
             return el;
         }));
+        return;
+      }
+
+      // 3. Plain text from outside → new text box in the middle of the view
+      if (text.trim()) {
+        e.preventDefault();
+        takeSnapshot();
+        const rect = workspaceRef.current.getBoundingClientRect();
+        const centerX = (-transform.x + rect.width / 2) / transform.scale;
+        const centerY = (-transform.y + rect.height / 2) / transform.scale;
+        const estLines = text.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / 30)), 0);
+        const h = Math.min(800, Math.max(60, estLines * 26 + 24));
+        const newText = {
+          id: generateId(), type: 'text', x: centerX - 160, y: centerY - h / 2, width: 320, height: h,
+          content: text, textColor: 'default', fontSize: 18, textAlign: 'left'
+        };
+        setElements(els => [...els, newText]);
+        setSelectedIds(new Set([newText.id]));
       }
     };
-    
+
     window.addEventListener('paste', handlePaste);
     return () => window.removeEventListener('paste', handlePaste);
-  }, [transform, isDark, elements]);
+  });
 
   // --- UNDO/REDO LOGIC ---
   const takeSnapshot = () => {
+    const { elements, frames, connections } = liveRef.current;
     setPast(p => {
         const last = p[p.length - 1];
         // Reference equality — state is immutable, so identical refs = no change.
@@ -1003,11 +1240,19 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
     setFuture([]);
   };
 
+  // A snapshot identical to the current board (e.g. taken by a plain click) is not a real step — skip it,
+  // otherwise Ctrl+Z "does nothing" until it is pressed a second time.
+  const sameAsBoard = (s, cur) => s.elements === cur.elements && s.frames === cur.frames && s.connections === cur.connections;
+
   const handleUndo = () => {
-    if (past.length === 0) return;
-    const previous = past[past.length - 1];
-    setFuture(f => [{ elements, frames, connections }, ...f]);
-    setPast(p => p.slice(0, -1));
+    const cur = liveRef.current;
+    const past = cur.past;
+    let i = past.length - 1;
+    while (i >= 0 && sameAsBoard(past[i], cur)) i--;
+    if (i < 0) { if (past.length) setPast([]); return; }
+    const previous = past[i];
+    setFuture(f => [{ elements: cur.elements, frames: cur.frames, connections: cur.connections }, ...f].slice(0, 50));
+    setPast(past.slice(0, i));
     setElements(previous.elements);
     setFrames(previous.frames);
     setConnections(previous.connections);
@@ -1016,10 +1261,14 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
   };
 
   const handleRedo = () => {
-    if (future.length === 0) return;
-    const next = future[0];
-    setPast(p => [...p, { elements, frames, connections }]);
-    setFuture(f => f.slice(1));
+    const cur = liveRef.current;
+    const future = cur.future;
+    let i = 0;
+    while (i < future.length && sameAsBoard(future[i], cur)) i++;
+    if (i >= future.length) { if (future.length) setFuture([]); return; }
+    const next = future[i];
+    setPast(p => [...p.slice(-49), { elements: cur.elements, frames: cur.frames, connections: cur.connections }]);
+    setFuture(future.slice(i + 1));
     setElements(next.elements);
     setFrames(next.frames);
     setConnections(next.connections);
@@ -1030,11 +1279,16 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
   // Keyboard Shortcuts (including Grouping Ctrl+G)
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+      const k = (e.key || '').toLowerCase(); // Caps Lock / Shift safe
+      const mod = e.ctrlKey || e.metaKey;
+      // Undo / Redo — inside a text field the browser's own text undo is used instead
+      if (mod && !e.altKey && k === 'z') {
+        if (isTypingInField()) return;
         if (e.shiftKey) handleRedo(); else handleUndo();
         e.preventDefault(); return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
+      if (mod && !e.altKey && k === 'y') {
+        if (isTypingInField()) return;
         handleRedo();
         e.preventDefault(); return;
       }
@@ -1048,9 +1302,10 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
       }
 
       // Save (Ctrl+S)
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      // Save As (Ctrl+Shift+S) — pick a new file location
+      if (mod && k === 's') {
         e.preventDefault();
-        saveToPC();
+        saveToPC({ saveAs: e.shiftKey });
         return;
       }
 
@@ -1095,53 +1350,57 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
         return;
       }
 
-      // Copy (Ctrl+C)
-      if ((e.ctrlKey || e.metaKey) && e.key === 'c' && !e.shiftKey) {
-        if (editingId !== null || ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
-        if (selectedIds.size > 0) {
-          const copiedEls = elements.filter(el => selectedIds.has(el.id));
-          const copiedFrames = frames.filter(f => selectedIds.has(f.id));
-          clipboardRef.current = { elements: copiedEls, frames: copiedFrames };
-        }
+      // Copy / Cut (Ctrl+C / Ctrl+X) — the native copy/cut event does the work (see handleCopy).
+      // Fallback for browsers that don't fire it when nothing is text-selected (e.g. Safari).
+      if (mod && !e.shiftKey && !e.altKey && (k === 'c' || k === 'x')) {
+        if (editingId !== null || isTypingInField()) return;
+        const isCut = k === 'x';
+        copyFiredRef.current = false;
+        setTimeout(() => {
+          if (copyFiredRef.current) return;
+          const p = buildClipboardPayload();
+          if (!p) return;
+          if (isCut) p.pasteCount = -1;
+          clipboardRef.current = p;
+          try { navigator.clipboard && navigator.clipboard.writeText(p.clipText).catch(() => {}); } catch (err) {}
+          if (isCut) deleteSelection();
+        }, 0);
         return;
       }
 
-      // Paste (Ctrl+V)
-      if ((e.ctrlKey || e.metaKey) && e.key === 'v' && !e.shiftKey) {
-        if (editingId !== null || ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
-        if (clipboardRef.current) {
-          takeSnapshot();
-          const offset = 30;
-          const idMap = {};
-          const newEls = clipboardRef.current.elements.map(el => {
-            const clone = JSON.parse(JSON.stringify(el));
-            clone.id = generateId();
-            idMap[el.id] = clone.id;
-            
-            if (clone.type === 'arrow') {
-                clone.startX += offset; clone.startY += offset;
-                clone.endX += offset; clone.endY += offset;
-            } else {
-                clone.x += offset; clone.y += offset;
-            }
-            
-            if (clone.tasks) clone.tasks.forEach(t => t.id = generateId());
-            return clone;
-          });
-          const newFrames = clipboardRef.current.frames.map(f => {
-            const clone = JSON.parse(JSON.stringify(f));
-            clone.id = generateId();
-            idMap[f.id] = clone.id;
-            clone.x += offset;
-            clone.y += offset;
-            return clone;
-          });
-          setElements(els => [...els, ...newEls]);
-          setFrames(fs => [...fs, ...newFrames]);
-          setSelectedIds(new Set([...newEls.map(e => e.id), ...newFrames.map(f => f.id)]));
-          // Update clipboard so next paste offsets further
-          clipboardRef.current = { elements: newEls, frames: newFrames };
-        }
+      // Paste (Ctrl+V) — the native paste event does the work (see handlePaste).
+      // Fallback: if the browser fires no paste event, paste our own board items.
+      if (mod && !e.shiftKey && !e.altKey && k === 'v') {
+        if (editingId !== null || isTypingInField()) return;
+        pasteFiredRef.current = false;
+        setTimeout(() => {
+          if (!pasteFiredRef.current && clipboardRef.current) pasteBoardData(clipboardRef.current);
+        }, 60);
+        return;
+      }
+
+      // Escape — always back to the Select/Move tool (1), from any tool or state.
+      // Finishes text editing, cancels half-drawn shapes/wires, deselects and closes panels.
+      if (e.key === 'Escape') {
+        if (isTypingInField()) document.activeElement.blur();
+        setActiveTool('select');
+        setShowShapeMenu(false);
+        setShowEmojiMenu(false);
+        setDrawingAction(null);
+        setCurrentPath(null);
+        setSelectionBox(null);
+        setCutLine(null);
+        setConnectingStart(null);
+        setTempConnectionEnd(null);
+        setTransferringConnections(null);
+        setHoveredPort(null);
+        setSelectedIds(new Set());
+        setEditingId(null);
+        setShowSearch(false);
+        setShowHelp(false);
+        setShowExportMenu(false);
+        setRightClickMenu(null);
+        setSearchQuery('');
         return;
       }
 
@@ -1155,17 +1414,6 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
       if (e.key === '5') { setActiveTool('card'); setShowShapeMenu(false); setShowEmojiMenu(false); return; }
       if (e.key === '6') { setActiveTool('emoji'); setShowEmojiMenu(true); setShowShapeMenu(false); return; }
       if (e.key === '7') { setActiveTool('arrow'); setShowShapeMenu(false); setShowEmojiMenu(false); return; }
-
-      // Escape to deselect
-      if (e.key === 'Escape') {
-        setSelectedIds(new Set());
-        setEditingId(null);
-        setShowSearch(false);
-        setShowHelp(false);
-        setRightClickMenu(null);
-        setSearchQuery('');
-        return;
-      }
 
       // Help Panel (?)
       if (e.key === '?' || e.key === '/') {
@@ -1424,18 +1672,12 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
       }
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selectedIds.size > 0) {
-            takeSnapshot();
-            setElements(els => els.filter(el => !selectedIds.has(el.id)));
-            setFrames(fs => fs.filter(f => !selectedIds.has(f.id)));
-            setConnections(cs => cs.filter(c => !selectedIds.has(c.fromId) && !selectedIds.has(c.toId)));
-            setSelectedIds(new Set());
-        }
+        deleteSelection();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedIds, elements, frames, editingId, past, future]);
+  }); // re-bound every render so shortcuts never act on stale board state
 
 
   // --- SAVE & EXPORT LOGIC ---
@@ -1450,7 +1692,26 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
     onClose();
   };
 
-  const saveToPC = async () => {
+  // Write to a known file. Asks the browser for write permission only if it hasn't been granted
+  // yet this session (e.g. after reopening the app) — that is a one-click browser prompt, not a picker.
+  const writeToHandle = async (handle, dataStr) => {
+    // Write directly first — a file picked this session already has write access.
+    // Only if Chrome refuses do we ask for permission (one click), then try once more.
+    let writable;
+    try {
+      writable = await handle.createWritable();
+    } catch (err) {
+      if (err.name !== 'NotAllowedError' || !handle.requestPermission) throw err;
+      const perm = await handle.requestPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') throw err;
+      writable = await handle.createWritable();
+    }
+    await writable.write(dataStr);
+    await writable.close();
+  };
+
+  const saveToPC = async (opts) => {
+    const saveAs = !!(opts && opts.saveAs === true);
     const projData = { ...project, elements, connections, frames, lastModified: Date.now(), acknowledgedStorageLimit: true, appVersion: APP_VERSION };
     setProject(projData);
     const dataStr = JSON.stringify(projData, null, 2);
@@ -1458,19 +1719,29 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
 
     try {
         if (window.showSaveFilePicker) {
-            // Desktop Chrome/Edge — native file picker
-            let handle = fileHandle;
+            // Desktop Chrome/Edge — save silently to the known file; only ask the first time (or on Save As)
+            let handle = saveAs ? null : fileHandle;
+            if (handle) {
+                try { await writeToHandle(handle, dataStr); }
+                catch (err) {
+                  // file moved/deleted or permission refused → ask once, and say why
+                  console.warn('Save to ' + handle.name + ' failed, asking for a location:', err);
+                  setSaveNotice(`Couldn't write to ${handle.name} (${err.name}) — choose where to save`);
+                  setTimeout(() => setSaveNotice(null), 8000);
+                  handle = null;
+                }
+            }
             if (!handle) {
                 handle = await window.showSaveFilePicker({
                     suggestedName: fileName,
                     types: [{ description: 'Utku Board File', accept: { 'application/json': ['.utkuboard'] } }]
                 });
-                setFileHandle(handle);
+                await writeToHandle(handle, dataStr);
             }
-            const writable = await handle.createWritable();
-            await writable.write(dataStr);
-            await writable.close();
-        } else if (navigator.share && navigator.canShare) {
+            setFileHandle(handle);
+            HandleStore.set(projData.id, handle);
+            setLastSaved(new Date().toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit' }));
+        } else if (isTouch && navigator.share && navigator.canShare) {
             // iOS/iPad — use Share Sheet (save to Files, AirDrop, etc.)
             const file = new File([dataStr], fileName, { type: 'application/json' });
             if (navigator.canShare({ files: [file] })) {
@@ -2070,7 +2341,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
             let minD = 60 / transform.scale;
             let closest = null;
             [...elements, ...frames].forEach(node => {
-                if (node.type === 'arrow') return;
+                if (node.type === 'arrow' || node.type === 'reroute') return;
                 ['top','bottom','left','right'].forEach(port => {
                     const coords = getPortCoords(node.id, port);
                     const dist = Math.hypot(coords.x - mouseX, coords.y - mouseY);
@@ -2163,7 +2434,10 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
       const checkPorts = (nodes) => {
           for (const node of nodes) {
               if (node.id === connectingStart.nodeId) continue;
-              ['top', 'bottom', 'left', 'right'].forEach(port => {
+              const ports = node.type === 'reroute'
+                ? [getPortCoords(connectingStart.nodeId, connectingStart.port).x <= node.x + node.width / 2 ? 'left' : 'right']
+                : ['top', 'bottom', 'left', 'right'];
+              ports.forEach(port => {
                   const coords = getPortCoords(node.id, port);
                   const dist = Math.hypot(coords.x - mouseX, coords.y - mouseY);
                   if (dist < minDistance) {
@@ -2716,6 +2990,40 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
   const updateElement = (id, updates) => setElements(els => els.map(el => el.id === id ? { ...el, ...updates } : el));
   const updateFrame = (id, updates) => setFrames(fs => fs.map(f => f.id === id ? { ...f, ...updates } : f));
 
+  // Double-click a wire → split it with a movable reroute node (Unreal Blueprint style).
+  // Drag the dot to move it; drag from its side handles to branch out as many wires as you like.
+  const REROUTE_W = 36, REROUTE_H = 24;
+  const insertReroute = (conn, e) => {
+    const rect = workspaceRef.current.getBoundingClientRect();
+    let x = (e.clientX - rect.left - transform.x) / transform.scale;
+    let y = (e.clientY - rect.top - transform.y) / transform.scale;
+    // Put the dot exactly on the wire (nearest point of the drawn path)
+    const pathEl = document.querySelector('path[data-conn-id="' + conn.id + '"]');
+    if (pathEl && pathEl.getTotalLength) {
+      try {
+        const L = pathEl.getTotalLength();
+        let best = null, bestD = Infinity;
+        for (let i = 0; i <= 80; i++) {
+          const pt = pathEl.getPointAtLength(L * i / 80);
+          const d = Math.hypot(pt.x - x, pt.y - y);
+          if (d < bestD) { bestD = d; best = pt; }
+        }
+        if (best) { x = best.x; y = best.y; }
+      } catch (err) {}
+    }
+    const p1 = getPortCoords(conn.fromId, conn.fromPort);
+    const p2 = getPortCoords(conn.toId, conn.toPort);
+    const ltr = p1.x <= p2.x; // flow direction decides which side is "in" and which is "out"
+    const rid = generateId();
+    takeSnapshot();
+    setElements(els => [...els, { id: rid, type: 'reroute', x: x - REROUTE_W / 2, y: y - REROUTE_H / 2, width: REROUTE_W, height: REROUTE_H, color: conn.color || '#e07a5f' }]);
+    setConnections(cs => cs.flatMap(c => c.id !== conn.id ? [c] : [
+      { ...c, toId: rid, toPort: ltr ? 'left' : 'right' },
+      { ...c, id: generateId(), fromId: rid, fromPort: ltr ? 'right' : 'left' }
+    ]));
+    setSelectedIds(new Set([rid]));
+  };
+
   const startConnection = (nodeId, port) => (e) => {
     e.stopPropagation();
     if (e.altKey) {
@@ -2775,6 +3083,9 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
   const getPortCoords = (nodeId, port) => {
     let node = elements.find(el => el.id === nodeId) || frames.find(f => f.id === nodeId);
     if (!node) return { x: 0, y: 0 };
+
+    // Reroute node: every wire meets at the dot's centre
+    if (node.type === 'reroute') return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
     
     // Board-card task output ports: measured from the live task row position
     if (node.type === 'card' && port && port.startsWith('out-')) {
@@ -2856,10 +3167,11 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
             <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs">
               {[
                 ['1-7', 'Tool selection'],
-                ['Ctrl+S', 'Save to PC'],
+                ['Ctrl+S', 'Save (same file after the first time)'],
+                ['Ctrl+Shift+S', 'Save As (choose a new file)'],
                 ['Ctrl+Z', 'Undo'],
                 ['Ctrl+Shift+Z / Ctrl+Y', 'Redo'],
-                ['Ctrl+C / Ctrl+V', 'Copy / Paste'],
+                ['Ctrl+C / X / V', 'Copy / Cut / Paste (also images, links, text)'],
                 ['Ctrl+D', 'Duplicate selection'],
                 ['Ctrl+A', 'Select all'],
                 ['Ctrl+F', 'Search elements'],
@@ -2871,7 +3183,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
                 ['Shift+Q', 'Distribute horizontal spacing'],
                 ['Shift+E', 'Distribute vertical spacing'],
                 ['Delete / Backspace', 'Delete selected'],
-                ['Escape', 'Deselect / Close panels'],
+                ['Escape', 'Back to Select tool, deselect, close panels'],
                 ['[ / ]', 'Send to back / Bring to front'],
                 ['?', 'Toggle this help'],
                 ['Alt+Drag', 'Clone element(s)'],
@@ -2887,8 +3199,9 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
                 ['Right-click selected', 'Context menu'],
                 ['Right-click canvas', 'Pan'],
                 ['Click connection', 'Cycle style (curved/straight/electric)'],
+                ['Double-click conn.', 'Add reroute node (drag its side dots to branch)'],
                 ['Right-click conn.', 'Toggle animation (flow/solid)'],
-                ['Mid-click conn.', 'Cycle line color'],
+                ['Mid-click / Alt+click conn.', 'Cycle line color (Mac: Option+click)'],
                 ['Shift+Drag canvas', 'Cut connections (knife)'],
               ].map(([key, desc]) => (
                 <React.Fragment key={key}>
@@ -3024,13 +3337,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
               }},
             ] : []),
             null, // separator
-            { icon: 'trash', label: 'Delete', shortcut: 'Del', danger: true, action: () => {
-              takeSnapshot();
-              setElements(els => els.filter(el => !selectedIds.has(el.id)));
-              setFrames(fs => fs.filter(f => !selectedIds.has(f.id)));
-              setConnections(cs => cs.filter(c => !selectedIds.has(c.fromId) && !selectedIds.has(c.toId)));
-              setSelectedIds(new Set());
-            }},
+            { icon: 'trash', label: 'Delete', shortcut: 'Del', danger: true, action: () => deleteSelection() },
           ].map((item, i) => item === null ? (
             <div key={i} className={`h-px mx-2 ${isDark ? 'bg-zinc-700' : 'bg-gray-200'}`}/>
           ) : (
@@ -3090,6 +3397,9 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
               {isUnsaved ? 'Unsaved' : 'Saved'}
             </span>
             {lastSaved && <span className="text-[9px] opacity-40">{lastSaved}</span>}
+            {saveNotice && <span className="text-[9px] text-yellow-500 max-w-[220px] truncate" title={saveNotice}>{saveNotice}</span>}
+            {!window.showSaveFilePicker && <span className="text-[9px] opacity-40" title="This browser can't save to the same file — each save downloads a new copy. Use Chrome or Edge for one-click saving.">· download mode</span>}
+            {fileHandle && <span className="text-[9px] opacity-40 max-w-[100px] truncate whitespace-nowrap" title={`Saving to ${fileHandle.name}`}>· {fileHandle.name}</span>}
           </div>
           <div className="relative">
             <button onClick={() => setShowExportMenu(!showExportMenu)} className="p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded-md transition" title="Export">
@@ -3113,7 +3423,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
             )}
           </div>
 
-          <button onClick={saveToPC} className="flex items-center justify-center p-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md transition shadow" title="Save file to PC">
+          <button onClick={() => saveToPC()} className="flex items-center justify-center p-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md transition shadow" title={fileHandle ? `Save to ${fileHandle.name} (Ctrl+S) · Save As: Ctrl+Shift+S` : 'Save file to PC (Ctrl+S)'}>
             <Icon name="save" size={14} />
           </button>
         </div>
@@ -3407,13 +3717,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
                                <Icon name={hasLocked ? "lock" : "unlock"} size={12} />
                              </button>
                            </div>
-                           <button onClick={() => {
-                              takeSnapshot();
-                              setElements(els => els.filter(e => !selectedIds.has(e.id)));
-                              setFrames(fs => fs.filter(f => !selectedIds.has(f.id)));
-                              setConnections(cs => cs.filter(c => !selectedIds.has(c.fromId) && !selectedIds.has(c.toId)));
-                              setSelectedIds(new Set());
-                           }} className="p-1 hover:bg-red-500/20 text-red-500 rounded-md transition"><Icon name="trash" size={14}/></button>
+                           <button onClick={() => deleteSelection()} className="p-1 hover:bg-red-500/20 text-red-500 rounded-md transition"><Icon name="trash" size={14}/></button>
                         </div>
                      </div>
                   );
@@ -3557,9 +3861,26 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
                     key={conn.id} 
                     className="pointer-events-auto cursor-pointer"
                     style={{ opacity: isolatedIds ? 0.1 : 1, transition: 'opacity 0.2s' }}
-                    onClick={() => {
-                      takeSnapshot();
-                      setConnections(cs => cs.map(c => c.id === conn.id ? { ...c, style: ['curved', 'straight', 'electric'][(['curved', 'straight', 'electric'].indexOf(c.style) + 1) % 3] } : c));
+                    onClick={(e) => {
+                      // Option/Alt+click = cycle color (Mac has no middle mouse button)
+                      if (e.altKey) {
+                        clearTimeout(connClickTimer.current);
+                        takeSnapshot();
+                        setConnections(cs => cs.map(cn => cn.id === conn.id ? { ...cn, color: PASTEL_COLORS[(PASTEL_COLORS.indexOf(cn.color) + 1) % PASTEL_COLORS.length] } : cn));
+                        return;
+                      }
+                      if (e.detail > 1) return; // part of a double-click
+                      clearTimeout(connClickTimer.current);
+                      connClickTimer.current = setTimeout(() => {
+                        takeSnapshot();
+                        setConnections(cs => cs.map(c => c.id === conn.id ? { ...c, style: ['curved', 'straight', 'electric'][(['curved', 'straight', 'electric'].indexOf(c.style) + 1) % 3] } : c));
+                      }, 220);
+                    }}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      if (e.altKey) return; // fast Option+clicks only change color
+                      clearTimeout(connClickTimer.current);
+                      insertReroute(conn, e);
                     }}
                     onContextMenu={(e) => { 
                       e.preventDefault(); e.stopPropagation();
@@ -3676,7 +3997,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
                   }}
                 >
                   {/* Connection Nodes */}
-                  {!el.locked && ['top', 'bottom', 'left', 'right'].map(port => {
+                  {!el.locked && el.type !== 'reroute' && ['top', 'bottom', 'left', 'right'].map(port => {
                      const isConnectingStart = connectingStart?.nodeId === el.id && connectingStart?.port === port;
                      const isHoveredTarget = connectingStart && hoveredPort?.nodeId === el.id && hoveredPort?.port === port;
                      const activeNodeClass = (isConnectingStart || isHoveredTarget) ? 'scale-150 bg-white border-indigo-500 opacity-100' : 'bg-indigo-500 border-white dark:border-zinc-900 opacity-0 group-hover:opacity-100 hover:scale-150';
@@ -3712,7 +4033,7 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
                   )}
 
                   {/* Universal Resize Handle */}
-                  {!['link', 'sequence'].includes(el.type) && !el.locked && (
+                  {!['link', 'sequence', 'reroute'].includes(el.type) && !el.locked && (
                      <div 
                        className="absolute bottom-0 right-0 w-6 h-6 cursor-se-resize z-50 opacity-0 group-hover:opacity-100 flex items-center justify-center bg-black/5 dark:bg-white/5 rounded-tl-lg"
                        onPointerDown={(e) => {
@@ -3736,6 +4057,26 @@ function Editor({ initialProject, theme, setTheme, onClose, onSave }) {
                       <Icon name="external" size={10} />
                     </div>
                   )}
+
+                  {/* REROUTE NODE (UE-style knot) */}
+                  {el.type === 'reroute' && (<>
+                    <div className="absolute rounded-full shadow-md pointer-events-none" style={{ left: '50%', top: '50%', width: 18, height: 18, transform: 'translate(-50%, -50%)', backgroundColor: el.color || '#e07a5f', border: `3px solid ${isDark ? '#f4f1ea' : '#1b1916'}` }} />
+                    {!el.locked && ['left', 'right'].map(port => {
+                      const active = (connectingStart?.nodeId === el.id && connectingStart?.port === port) || (connectingStart && hoveredPort?.nodeId === el.id && hoveredPort?.port === port);
+                      return (
+                        <div
+                          key={port}
+                          onPointerDown={startConnection(el.id, port)}
+                          onPointerUp={completeConnection(el.id, port)}
+                          onPointerEnter={() => setHoveredPort({ nodeId: el.id, port })}
+                          onPointerLeave={() => setHoveredPort(null)}
+                          title="Drag to branch a new wire"
+                          className={`absolute w-3 h-3 rounded-full border-2 z-50 cursor-crosshair transition-opacity ${active ? 'opacity-100 scale-150 bg-white border-indigo-500' : 'bg-indigo-500 border-white dark:border-zinc-900 opacity-0 group-hover:opacity-100 hover:scale-150'}`}
+                          style={{ top: '50%', [port]: -10, transform: 'translateY(-50%)' }}
+                        />
+                      );
+                    })}
+                  </>)}
 
                   {/* SHAPES */}
                   {el.type === 'rect' && (
