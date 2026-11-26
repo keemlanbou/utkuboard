@@ -1,14 +1,16 @@
+<p align="center"><img src="assets/icon.png" width="128" alt="Utku Board icon"></p>
+
 # Utku Board
 
 **A single-file infinite canvas whiteboard.** No install, no server, no account — just open one HTML file in your browser.
 
 **[▶ Try it live](https://keemlanbou.github.io/utkuboard/)** · [Download](https://github.com/keemlanbou/utkuboard/releases) · [Watch the demo](https://youtu.be/Ak81a9eJCTM)
 
-![screenshot](screenshot.png)
+![screenshot](assets/screenshot.png)
 
 ## Why
 
-Most whiteboard apps need an account, a subscription, or an internet connection. Utku Board is one ~235 KB HTML file. Your projects are saved as local `.utkuboard` files on your own disk — nothing is uploaded anywhere.
+Most whiteboard apps need an account, a subscription, or an internet connection. Utku Board is one ~250 KB HTML file. Your projects are saved as local `.utkuboard` files on your own disk — nothing is uploaded anywhere.
 
 ## Features
 

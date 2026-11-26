@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1254 1254">
+  <defs>
+    <radialGradient id="glow" cx="470" cy="618" r="175" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e07a5f" stop-opacity=".6"/>
+      <stop offset="1" stop-color="#e07a5f" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" x="107" y="89" width="116" height="112.5" patternUnits="userSpaceOnUse">
+      <circle cx="58" cy="56" r="6.5" fill="#3d362e"/>
+    </pattern>
+    <clipPath id="tile"><rect x="12" y="12" width="1230" height="1230" rx="290"/></clipPath>
+  </defs>
+  <rect x="12" y="12" width="1230" height="1230" rx="290" fill="#1b1916"/>
+  <rect x="100" y="90" width="1060" height="1100" fill="url(#dots)" clip-path="url(#tile)"/>
+  <g stroke="#6e655b" stroke-width="7" fill="#2a2520">
+    <rect x="143" y="507" width="324" height="237" rx="52"/>
+    <rect x="773" y="246" width="336" height="236" rx="52"/>
+    <rect x="756" y="770" width="353" height="236" rx="52"/>
+  </g>
+  <g stroke="#ece5d7" stroke-width="30" stroke-linecap="round">
+    <path d="M218 593H368M218 656H330"/>
+    <path d="M862 333H1036M862 396H998"/>
+    <path d="M843 856H1036M843 920H987"/>
+  </g>
+  <circle cx="470" cy="618" r="175" fill="url(#glow)"/>
+  <path d="M447 625C560 600 600 375 782 366" fill="none" stroke="#e07a5f" stroke-width="23"/>
+  <path d="M475 640C545 680 565 765 600 818S690 888 735 890" fill="none" stroke="#e07a5f" stroke-width="22" stroke-linecap="round" stroke-dasharray="34 40"/>
+  <g fill="#e07a5f" stroke="#f4f1ea" stroke-width="8">
+    <circle cx="447" cy="625" r="30"/>
+    <circle cx="782" cy="366" r="30"/>
+    <circle cx="760" cy="890" r="30"/>
+  </g>
+</svg>
